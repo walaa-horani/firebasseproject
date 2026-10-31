@@ -1,0 +1,384 @@
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// Collection: users
+// Document ID: Firebase Auth uid
+// Fields (all optional; doc may be created by markRead() before a profile exists):
+//   - displayName: string (1-100)
+//   - photoURL: string (https, <= 2048) | null
+//   - reads: map<roomId, { count: int, at: timestamp }> (<= 1000 entries)
+//       Per-room read cursors. Only the owner can read/write them, so a bad value
+//       can only corrupt the owner's own unread badges. Rules cannot index into
+//       the changed map key, so per-entry validation is done client-side.
+//
+// Collection: rooms
+// Document ID: auto id
+// Fields (all required):
+//   - name: string (1-100)
+//   - createdBy: uid string (immutable) - the owner; can never be removed
+//   - createdAt: timestamp (immutable, == request.time on create)
+//   - memberIds: list<uid> (1-200) - access control; queried with array-contains
+//   - members: map<uid, Member> (<= 500 entries; leavers kept with left: true)
+//       Member = { name: string 1-100, photoURL: https string | null,
+//                  role: 'owner'|'admin'|'member', joinedAt: timestamp, left?: true }
+//   - lastMessage: null | { id: string, text: string 1-140, senderId: uid, sentAt: timestamp }
+//   - lastMessageAt: timestamp (room-list sort key)
+//   - messageCount: int >= 0 (exactly +1 per message, in the same batch)
+//
+// Collection: rooms/{roomId}/messages
+// Document ID: auto id
+// Fields:
+//   - senderId: uid string (required, immutable, == auth.uid)
+//   - text: string (1-4000; '' only when deleted)
+//   - type: 'text' | 'system' (clients may only create 'text')
+//   - sentAt: timestamp (required, immutable, == request.time on create)
+//   - editedAt: timestamp (optional, == request.time on every update)
+//   - deleted: bool (optional; soft delete, irreversible)
+//
+// Collection: users/{uid}/devices
+// Document ID: sha-256 hex of the FCM token (64 chars)
+// Fields (all required):
+//   - token: string (1-4096) - FCM registration token for this browser
+//   - updatedAt: timestamp (== request.time)
+//   Owner-only. Read by Cloud Functions (Admin SDK) to address web pushes.
+//
+// Collection: roomTokens/{roomId}
+//   Server-only cache { tokens: { [uid]: { [deviceId]: token } } } maintained by
+//   Cloud Functions so each message costs 1 read to fan out. No client access.
+//
+// Billed rule reads (Standard edition charges each dependent doc access):
+//   - send message: 1 (getAfter room) + 1 (getAfter message)
+//   - message query/listener, edit, soft delete: 1 (get room)
+//   - room and user reads/writes: 0
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function changedKeys() {
+      return incoming().diff(existing()).affectedKeys();
+    }
+
+    function isStr(v, minLen, maxLen) {
+      return v is string && v.size() >= minLen && v.size() <= maxLen;
+    }
+
+    function isUid(v) {
+      return isStr(v, 1, 128);
+    }
+
+    function isPhoto(v) {
+      return v == null || (isStr(v, 9, 2048) && v.matches('^https://.*'));
+    }
+
+    function roomPath(roomId) {
+      return /databases/$(database)/documents/rooms/$(roomId);
+    }
+
+    function msgPath(roomId, messageId) {
+      return /databases/$(database)/documents/rooms/$(roomId)/messages/$(messageId);
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    function isValidUser(data) {
+      return data.keys().hasOnly(['displayName', 'photoURL', 'reads'])
+        && (!('displayName' in data) || isStr(data.displayName, 1, 100))
+        && (!('photoURL' in data) || isPhoto(data.photoURL))
+        && (!('reads' in data) || (data.reads is map && data.reads.size() <= 1000));
+    }
+
+    function isValidDevice(data) {
+      return data.keys().hasAll(['token', 'updatedAt'])
+        && data.keys().hasOnly(['token', 'updatedAt'])
+        && isStr(data.token, 1, 4096)
+        && data.updatedAt == request.time;
+    }
+
+    function isValidMember(m) {
+      return m is map
+        && m.keys().hasAll(['name', 'photoURL', 'role', 'joinedAt'])
+        && m.keys().hasOnly(['name', 'photoURL', 'role', 'joinedAt', 'left'])
+        && isStr(m.name, 1, 100)
+        && isPhoto(m.photoURL)
+        && m.role in ['owner', 'admin', 'member']
+        && m.joinedAt is timestamp
+        && (!('left' in m) || m.left == true);
+    }
+
+    function isValidLastMessage(lm) {
+      return lm == null || (
+        lm is map
+        && lm.keys().hasAll(['id', 'text', 'senderId', 'sentAt'])
+        && lm.keys().hasOnly(['id', 'text', 'senderId', 'sentAt'])
+        && isStr(lm.id, 1, 128)
+        && isStr(lm.text, 1, 140)
+        && isUid(lm.senderId)
+        && lm.sentAt is timestamp
+      );
+    }
+
+    // Shape of every room after any create or update.
+    function isValidRoom(data) {
+      let fields = ['name', 'createdBy', 'createdAt', 'memberIds', 'members',
+                    'lastMessage', 'lastMessageAt', 'messageCount'];
+      return data.keys().hasAll(fields)
+        && data.keys().hasOnly(fields)
+        && isStr(data.name, 1, 100)
+        && isUid(data.createdBy)
+        && data.createdAt is timestamp
+        && data.memberIds is list
+        && data.memberIds.size() >= 1
+        && data.memberIds.size() <= 200
+        && data.createdBy in data.memberIds
+        && data.members is map
+        && data.members.size() <= 500
+        && isValidLastMessage(data.lastMessage)
+        && data.lastMessageAt is timestamp
+        && data.messageCount is int
+        && data.messageCount >= 0;
+    }
+
+    function isValidMessage(data) {
+      return data.keys().hasAll(['senderId', 'text', 'type', 'sentAt'])
+        && data.keys().hasOnly(['senderId', 'text', 'type', 'sentAt', 'editedAt', 'deleted'])
+        && isUid(data.senderId)
+        && data.type in ['text', 'system']
+        && data.sentAt is timestamp
+        && (!('editedAt' in data) || data.editedAt is timestamp)
+        && (!('deleted' in data) || data.deleted is bool)
+        && data.text is string
+        && data.text.size() <= 4000
+        && (data.text.size() >= 1 || data.get('deleted', false) == true);
+    }
+
+    // ===============================================================
+    // Room membership / roles (from room data already in hand: no extra reads)
+    // ===============================================================
+
+    function isMember(room) {
+      return isAuthenticated() && request.auth.uid in room.memberIds;
+    }
+
+    function roleOf(room) {
+      return room.members[request.auth.uid].role;
+    }
+
+    function isManager(room) {
+      return isMember(room) && roleOf(room) in ['owner', 'admin'];
+    }
+
+    // ===============================================================
+    // Room write operations
+    // ===============================================================
+
+    function isValidRoomCreate() {
+      let d = incoming();
+      let me = request.auth.uid;
+      return d.createdBy == me
+        && d.memberIds == [me]
+        && d.members.keys().hasOnly([me])
+        && isValidMember(d.members[me])
+        && d.members[me].role == 'owner'
+        && !('left' in d.members[me])
+        && d.members[me].joinedAt == request.time
+        && d.createdAt == request.time
+        && d.lastMessageAt == request.time
+        && d.lastMessage == null
+        && d.messageCount == 0;
+    }
+
+    // Preview + counter bump batched with a brand-new message by the same user.
+    function isValidSendUpdate(roomId) {
+      let d = incoming();
+      let old = existing();
+      return isMember(old)
+        && changedKeys().hasOnly(['lastMessage', 'lastMessageAt', 'messageCount'])
+        && d.messageCount == old.messageCount + 1
+        && d.lastMessage != null
+        && d.lastMessage.senderId == request.auth.uid
+        && d.lastMessage.sentAt == request.time
+        && d.lastMessageAt == request.time
+        && isNewMessageInBatch(roomId, d.lastMessage.id);
+    }
+
+    // sentAt == request.time proves the message is created in this same request,
+    // so the counter cannot be bumped by pointing at an old message.
+    function isNewMessageInBatch(roomId, messageId) {
+      let msg = getAfter(msgPath(roomId, messageId));
+      return msg != null
+        && msg.data.senderId == request.auth.uid
+        && msg.data.sentAt == request.time;
+    }
+
+    function isValidAddMember() {
+      let d = incoming();
+      let old = existing();
+      let added = d.memberIds.removeAll(old.memberIds);
+      return isManager(old)
+        && changedKeys().hasOnly(['memberIds', 'members'])
+        && d.memberIds.size() == old.memberIds.size() + 1
+        && d.memberIds.hasAll(old.memberIds)
+        && added.size() == 1
+        && isNewMemberEntry(d, old, added[0]);
+    }
+
+    function isNewMemberEntry(d, old, uid) {
+      return isUid(uid)
+        && d.members.diff(old.members).affectedKeys().hasOnly([uid])
+        && isValidMember(d.members[uid])
+        && !('left' in d.members[uid])
+        && d.members[uid].joinedAt == request.time
+        // Only the owner may grant admin; nobody may grant owner.
+        && (d.members[uid].role == 'member'
+            || (d.members[uid].role == 'admin' && roleOf(old) == 'owner'));
+    }
+
+    function isValidRemoveMember() {
+      let d = incoming();
+      let old = existing();
+      let removed = old.memberIds.removeAll(d.memberIds);
+      return changedKeys().hasOnly(['memberIds', 'members'])
+        && d.memberIds.size() == old.memberIds.size() - 1
+        && old.memberIds.hasAll(d.memberIds)
+        && removed.size() == 1
+        && isLeftEntry(d, old, removed[0])
+        && canRemove(old, removed[0]);
+    }
+
+    // Removed member's entry is kept, only flagged left: true.
+    function isLeftEntry(d, old, uid) {
+      return d.members.diff(old.members).affectedKeys().hasOnly([uid])
+        && d.members[uid].diff(old.members[uid]).affectedKeys().hasOnly(['left'])
+        && d.members[uid].left == true;
+    }
+
+    // Anyone may leave; admins remove members; only the owner removes admins.
+    // The owner is never removable (isValidRoom requires createdBy in memberIds).
+    function canRemove(old, uid) {
+      return (uid == request.auth.uid && isMember(old))
+        || (isManager(old) && (old.members[uid].role == 'member' || roleOf(old) == 'owner'));
+    }
+
+    function isValidRename() {
+      return isManager(existing()) && changedKeys().hasOnly(['name']);
+    }
+
+    // ===============================================================
+    // Message write operations
+    // ===============================================================
+
+    function isValidMessageCreate(roomId, messageId) {
+      let d = incoming();
+      let roomAfter = getAfter(roomPath(roomId)).data;
+      return d.keys().hasOnly(['senderId', 'text', 'type', 'sentAt'])
+        && d.senderId == request.auth.uid
+        && d.type == 'text'
+        && d.sentAt == request.time
+        && d.text.size() >= 1
+        && isMember(roomAfter)
+        // Room preview must point at this message, which forces the counter
+        // update (validated by isValidSendUpdate) into the same batch.
+        && roomAfter.lastMessage != null
+        && roomAfter.lastMessage.id == messageId;
+    }
+
+    function isValidEdit() {
+      return changedKeys().hasOnly(['text', 'editedAt'])
+        && incoming().text.size() >= 1;
+    }
+
+    function isValidSoftDelete() {
+      return changedKeys().hasOnly(['text', 'editedAt', 'deleted'])
+        && incoming().deleted == true
+        && incoming().text == '';
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      // Owner only: read cursors are private.
+      allow read: if isOwner(userId);
+      allow create, update: if isOwner(userId) && isValidUser(incoming());
+      allow delete: if false;
+
+      // Push devices: the owner registers/unregisters this browser's FCM token.
+      match /devices/{deviceId} {
+        allow read, delete: if isOwner(userId);
+        allow create, update: if isOwner(userId)
+          && deviceId.matches('^[0-9a-f]{64}$')
+          && isValidDevice(incoming());
+      }
+    }
+
+    // Server-only token cache (Cloud Functions use the Admin SDK, which bypasses rules).
+    match /roomTokens/{roomId} {
+      allow read, write: if false;
+    }
+
+    match /rooms/{roomId} {
+      // Supports: where('memberIds', 'array-contains', uid).orderBy('lastMessageAt', 'desc')
+      allow read: if isMember(existing());
+
+      allow create: if isAuthenticated()
+        && isValidRoom(incoming())
+        && isValidRoomCreate();
+
+      allow update: if isAuthenticated()
+        && isValidRoom(incoming())
+        && (isValidSendUpdate(roomId)
+            || isValidAddMember()
+            || isValidRemoveMember()
+            || isValidRename());
+
+      allow delete: if isAuthenticated() && existing().createdBy == request.auth.uid;
+
+      match /messages/{messageId} {
+        // 1 billed read (room doc) per query/listener, not per message returned.
+        allow read: if isMember(get(roomPath(roomId)).data);
+
+        allow create: if isAuthenticated()
+          && isValidMessage(incoming())
+          && isValidMessageCreate(roomId, messageId);
+
+        // Sender may edit or soft-delete their own message while still a member.
+        allow update: if isAuthenticated()
+          && isValidMessage(incoming())
+          && existing().senderId == request.auth.uid
+          && existing().get('deleted', false) != true
+          && incoming().editedAt == request.time
+          && (isValidEdit() || isValidSoftDelete())
+          && isMember(get(roomPath(roomId)).data);
+
+        allow delete: if false;
+      }
+    }
+  }
+}
